@@ -1,5 +1,80 @@
 # Suvidha
 
+**A welfare concierge for India's informal workforce — over a phone call, in the user's own language.**
+
+Suvidha's users (domestic workers, drivers, cooks, tailors, farmers) often cannot read. So the product is a *conversation*, not a form: the user tells their story, Suvidha figures out which government schemes they actually qualify for, reads the exact next steps aloud, and — from photos of their documents — hands them a pre-filled application to take to a Common Service Centre.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph Caller["📞 Caller (any Indian language)"]
+        U["User speaks their story<br/>(no reading, no typing)"]
+    end
+
+    subgraph Frontend["Voice Frontend · components/VoiceConversation.tsx"]
+        MIC["Mic capture + silence auto-stop<br/>+ progressive 'thinking' status"]
+        DOC["Document camera capture"]
+        CARDS["Spoken reply + scheme cards<br/>+ pre-filled application"]
+    end
+
+    subgraph API["Next.js API Routes (server-side, keys never hit browser)"]
+        STT["/api/stt"]
+        CHAT["/api/chat<br/>story-driven dialogue"]
+        TTS["/api/tts"]
+        DOCAI["/api/docai<br/>OCR → fields → pre-fill"]
+        STEPS["/api/next-steps"]
+    end
+
+    subgraph Sarvam["Sarvam AI (single vendor)"]
+        S_STT["Speech-to-Text<br/>saaras:v3 · auto-detect language"]
+        S_LLM["Chat LLM<br/>sarvam-30b (English pivot)"]
+        S_TR["Translate · Mayura<br/>(batched, both directions)"]
+        S_TTS["Text-to-Speech<br/>bulbul:v3"]
+        S_DOC["Document Intelligence<br/>OCR, 23 languages"]
+    end
+
+    subgraph Matching["Scheme Matching"]
+        LOCAL["Keyword matcher<br/>lib/schemes.ts · 4769 schemes<br/>(state + occupation + life-situation)"]
+        SEM["Semantic search (optional)<br/>Supabase pgvector / Pinecone<br/>api.py · scheme_search.py"]
+    end
+
+    subgraph Data["Scheme Data"]
+        MD["schemedata/*.md<br/>4769 myScheme.gov.in schemes"]
+        IDX["lib/schemes-index.json<br/>(build-time index)"]
+        VEC["pgvector / Pinecone<br/>OpenAI embeddings"]
+    end
+
+    U --> MIC
+    MIC -->|audio| STT --> S_STT
+    STT -->|transcript + language| CHAT
+    CHAT <-->|translate in/out| S_TR
+    CHAT -->|English| S_LLM
+    CHAT --> LOCAL
+    CHAT -.->|when configured| SEM
+    LOCAL --> IDX
+    SEM --> VEC
+    CHAT -->|reply + schemes + spoken summary| CARDS
+    CARDS -->|speak| TTS --> S_TTS
+    DOC -->|photo| DOCAI --> S_DOC
+    DOCAI --> STEPS
+    DOCAI -->|extracted fields + pre-filled form| CARDS
+    MD --> IDX
+    MD --> VEC
+```
+
+### How a call flows
+
+1. **Listen** — the user speaks; `saaras:v3` transcribes and **auto-detects** the language (no forced default).
+2. **Converse** — `/api/chat` runs a *story-driven* dialogue: it extracts only what the user actually said (occupation, state, gender, widow/disability/children/housing status) and asks one warm follow-up that builds on the last answer. The LLM works in English for reliability; Mayura translates in and out.
+3. **Match** — `matchSchemes()` scores all 4769 schemes on state + occupation + **life-situation signals** (the things that unlock widow pensions, scholarships, disability support, housing). An optional semantic-search backend (below) can replace this with pgvector/Pinecone retrieval.
+4. **Guide** — Suvidha reads aloud the matched schemes and the one exact next step for each; the cards show personalized, ordered to-dos.
+5. **Fill** — the user photographs a document; **Document Intelligence** OCRs it, fields are extracted, required documents are ticked, and a **pre-filled application** is generated to carry to the CSC.
+
+> The current mic-based web UI is a stand-in for a real telephony flow (Exotel/Twilio + Sarvam) — the same server pipeline drives both.
+
+See [`SARVAM.md`](./SARVAM.md) for exact Sarvam API usage, parameters, and measured latencies.
+
 ## Supabase pgvector scheme search
 
 `supabase_schemes.py` embeds `chunk_text` with OpenAI's `text-embedding-3-small` and stores the 1,536-dimension vectors in Supabase pgvector. It splits each scraped Markdown scheme by section, excludes `## Complete Source Data`, and stores the source chunk plus `slug`, `title`, `section`, `state`, and `source_url`.
